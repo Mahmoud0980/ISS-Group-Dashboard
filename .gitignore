@@ -1,0 +1,18 @@
+# Secrets
+.env
+.env.*
+credentials
+*.pem
+*.p12
+
+# Node
+node_modules/
+dist/
+build/
+.cache/
+
+# OS / أدوات
+.DS_Store
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
