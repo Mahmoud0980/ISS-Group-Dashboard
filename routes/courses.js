@@ -5,9 +5,11 @@ const multer = require("multer");
 const Course = require("../models/Course");
 const { _getClient } = require("../config/googleSheets");
 
-// التخزين (Cloudinary أو بدّلها بـ memoryStorage مؤقتًا)
-// const storage = multer.memoryStorage();
+// التخزين (Cloudinary). لو ما عندك ملف cloudinaryStorage، استبدل بسطر واحد:
 const storage = require("../config/cloudinaryStorage");
+// بديل مؤقت بدون رفع فعلي:
+// const storage = multer.memoryStorage();
+
 const upload = multer({ storage });
 
 // Google Sheets helpers
@@ -30,14 +32,53 @@ const DAYS = [
   { ar: "الجمعة", en: "Friday" },
 ];
 
-/* ================= أدوات وقت مرنة ================= */
-const arabicDigitsMap = { "٠":"0","١":"1","٢":"2","٣":"3","٤":"4","٥":"5","٦":"6","٧":"7","٨":"8","٩":"9" };
-const normalizeDigits = (s) => String(s || "").replace(/[٠-٩]/g, (d) => arabicDigitsMap[d] || d);
+/* ================= helpers: slug ================= */
+const slugify = (s = "") =>
+  String(s)
+    .toLowerCase()
+    .trim()
+    .replace(/[^\w\s-]/g, "")
+    .replace(/\s+/g, "-");
+
+async function ensureUniqueSlug(base, excludeId = null) {
+  let root =
+    slugify(base) ||
+    Date.now().toString(36); // fallback لو فاضي
+  let candidate = root;
+  let n = 1;
+  const q = (slug) =>
+    excludeId ? { slug, _id: { $ne: excludeId } } : { slug };
+  // كرر حتى تلاقي slug غير مستخدم
+  // ملاحظة: هذا متساهل، في سباقات متزامنة ممكن يرجع 11000؛ لذلك لسه منمسك 11000 تحت.
+  while (await Course.exists(q(candidate))) {
+    n += 1;
+    candidate = `${root}-${n}`;
+  }
+  return candidate;
+}
+
+/* ============ أدوات وقت مرنة (24h / 12h / ص-م / أرقام عربية) ============ */
+const arabicDigitsMap = {
+  "٠": "0",
+  "١": "1",
+  "٢": "2",
+  "٣": "3",
+  "٤": "4",
+  "٥": "5",
+  "٦": "6",
+  "٧": "7",
+  "٨": "8",
+  "٩": "9",
+};
+const normalizeDigits = (s) =>
+  String(s || "").replace(/[٠-٩]/g, (d) => arabicDigitsMap[d] || d);
+
 const clean = (s) =>
   normalizeDigits(String(s || ""))
     .replace(/\u200E|\u200F|\u202A|\u202B|\u202C|\u202D|\u202E/g, "")
     .replace(/\s+/g, " ")
     .trim();
+
 const pad = (n) => String(n).padStart(2, "0");
 
 const to24 = (raw) => {
@@ -56,23 +97,35 @@ const to24 = (raw) => {
     let h = parseInt(m[1], 10);
     const mm = pad(m[2]);
     const ap = m[3].toUpperCase();
-    if (ap === "AM") { if (h === 12) h = 0; } else { if (h !== 12) h += 12; }
+    if (ap === "AM") {
+      if (h === 12) h = 0;
+    } else {
+      if (h !== 12) h += 12;
+    }
     return `${pad(h)}:${mm}`;
   }
   return null;
 };
 
-const toMinutes = (t) => { const [h, m] = t.split(":").map(Number); return h * 60 + m; };
-const fromMinutes = (mins) => { const h = Math.floor(mins / 60) % 24; const m = mins % 60; return `${pad(h)}:${pad(m)}`; };
+const toMinutes = (t) => {
+  const [h, m] = t.split(":").map(Number);
+  return h * 60 + m;
+};
+const fromMinutes = (mins) => {
+  const h = Math.floor(mins / 60) % 24;
+  const m = mins % 60;
+  return `${pad(h)}:${pad(m)}`;
+};
 const addMinutes = (t, minutes) => {
   const total = toMinutes(t) + minutes;
   const dayDelta = Math.floor(total / 1440);
   return { time: fromMinutes((total + 1440) % 1440), dayDelta };
 };
+
 const splitRange = (val) => clean(val).split(/\s*[-–—]\s*/);
 
 /** 🔓 مدى مرن:
- * - start-only  ➜ يحسب النهاية +120 دقيقة (بدون السماح بعبور يوم جديد)
+ * - start-only  ➜ يحسب النهاية +120 دقيقة بشرط عدم عبور اليوم
  * - start - end ➜ يقبل أي مدة بشرط أن تكون النهاية بعد البداية وفي نفس اليوم
  */
 const toRangeFlexible = (val) => {
@@ -83,16 +136,21 @@ const toRangeFlexible = (val) => {
   if (parts.length === 2) {
     const a24 = to24(parts[0]);
     const b24 = to24(parts[1]);
-    if (!a24 || !b24) return { ok: false, msg: "اكتب الوقت بصيغة HH:MM أو HH:MM AM/PM" };
+    if (!a24 || !b24)
+      return { ok: false, msg: "اكتب الوقت بصيغة HH:MM أو HH:MM AM/PM" };
     if (toMinutes(b24) < toMinutes(a24)) {
-      return { ok: false, msg: "وقت النهاية يجب أن يكون بعد البداية في نفس اليوم" };
+      return {
+        ok: false,
+        msg: "وقت النهاية يجب أن يكون بعد البداية في نفس اليوم",
+      };
     }
     return { ok: true, range: `${a24} - ${b24}` };
   } else {
     const a24 = to24(v);
     if (!a24) return { ok: false, msg: "اكتب الوقت بصيغة HH:MM مثل 17:30" };
     const { time: end, dayDelta } = addMinutes(a24, 120);
-    if (dayDelta !== 0) return { ok: false, msg: "لا يمكن أن يمتد الوقت لليوم التالي" };
+    if (dayDelta !== 0)
+      return { ok: false, msg: "لا يمكن أن يمتد الوقت لليوم التالي" };
     return { ok: true, range: `${a24} - ${end}` };
   }
 };
@@ -101,8 +159,11 @@ const toRangeFlexible = (val) => {
 function parseSchedule(raw) {
   let arr = raw;
   if (typeof raw === "string") {
-    try { arr = JSON.parse(raw); }
-    catch { throw new Error("صيغة جدول التدريب غير صحيحة (JSON)."); }
+    try {
+      arr = JSON.parse(raw);
+    } catch {
+      throw new Error("صيغة جدول التدريب غير صحيحة (JSON).");
+    }
   }
   if (!Array.isArray(arr) || arr.length === 0) {
     throw new Error("يجب اختيار يوم واحد على الأقل مع تحديد الأوقات.");
@@ -121,7 +182,6 @@ function parseSchedule(raw) {
     if (byEn.has(day_en)) throw new Error(`يوم مكرر: ${day_en}`);
     byEn.add(day_en);
 
-    // ✅ مرن
     const ar = toRangeFlexible(time_ar_raw);
     const en = toRangeFlexible(time_en_raw);
     if (!ar.ok) throw new Error(`وقت غير صالح لليوم ${day_ar}. ${ar.msg}`);
@@ -145,10 +205,11 @@ router.get("/", async (_req, res) => {
 });
 
 /* ======================= CREATE ======================= */
-// الصورة + formLink + sheetLink اختياريّة
+// الصورة + formLink + sheetLink اختيارية
 router.post("/", upload.single("image"), async (req, res) => {
   try {
-    const normalizedSheetLink = req.body.sheetLink || req.body.sheetLinkl || "";
+    const normalizedSheetLink =
+      req.body.sheetLink || req.body.sheetLinkl || "";
 
     const payload = {
       slug: req.body.slug,
@@ -162,7 +223,7 @@ router.post("/", upload.single("image"), async (req, res) => {
       instructor_en: req.body.instructor_en,
       trainingHours_ar: req.body.trainingHours_ar,
       trainingHours_en: req.body.trainingHours_en,
-      formLink: req.body.formLink || "",    // اختياري
+      formLink: req.body.formLink || "", // اختياري
       sheetLink: normalizedSheetLink || "", // اختياري
     };
 
@@ -182,8 +243,16 @@ router.post("/", upload.single("image"), async (req, res) => {
     ];
     const missing = required.filter((k) => !payload[k]);
     if (missing.length) {
-      return res.status(400).json({ error: `حقول ناقصة: ${missing.join(", ")}` });
+      return res
+        .status(400)
+        .json({ error: `حقول ناقصة: ${missing.join(", ")}` });
     }
+
+    // slug فريد تلقائيًا (حتى لو وصل مكرر)
+    payload.slug =
+      await ensureUniqueSlug(
+        payload.slug || payload.title_en || payload.title_ar
+      );
 
     // تحقق المستويات
     if (!allowedLevelsAR.includes(payload.level_ar)) {
@@ -196,8 +265,8 @@ router.post("/", upload.single("image"), async (req, res) => {
     // الجدول الزمني (مطلوب)
     const trainingSchedule = parseSchedule(req.body.trainingSchedule);
 
-    // الصورة اختياريّة
-    const imageUrl = req.file ? req.file.path : (req.body.image || "");
+    // الصورة اختيارية
+    const imageUrl = req.file ? req.file.path : req.body.image || "";
 
     const newCourse = new Course({
       slug: payload.slug,
@@ -218,21 +287,32 @@ router.post("/", upload.single("image"), async (req, res) => {
     });
 
     await newCourse.save();
-    res.status(201).json({ message: "✅ تم إضافة الكورس بنجاح", course: newCourse });
+    res
+      .status(201)
+      .json({ message: "✅ تم إضافة الكورس بنجاح", course: newCourse });
   } catch (err) {
+    if (err && err.code === 11000) {
+      return res
+        .status(409)
+        .json({ error: "الـ slug مستخدم مسبقًا. حاول باسم آخر." });
+    }
     console.error("فشل في إضافة الكورس:", err.message);
     res.status(500).json({ error: err.message || "حدث خطأ أثناء حفظ الكورس" });
   }
 });
 
 /* ======================= UPDATE ======================= */
+// يقبل FormData أو JSON
 router.put("/:id", upload.single("image"), async (req, res) => {
   try {
     const body = { ...req.body };
 
     if (typeof body.trainingSchedule === "string") {
-      try { body.trainingSchedule = JSON.parse(body.trainingSchedule); }
-      catch { body.trainingSchedule = []; }
+      try {
+        body.trainingSchedule = JSON.parse(body.trainingSchedule);
+      } catch {
+        body.trainingSchedule = [];
+      }
     }
 
     if (Array.isArray(body.trainingSchedule) && body.trainingSchedule.length) {
@@ -240,7 +320,9 @@ router.put("/:id", upload.single("image"), async (req, res) => {
     }
 
     // صورة اختيارية
-    if (req.file) body.image = req.file.path;
+    if (req.file) {
+      body.image = req.file.path;
+    }
 
     // sheetLinkl → sheetLink
     if (body.sheetLinkl && !body.sheetLink) {
@@ -248,15 +330,31 @@ router.put("/:id", upload.single("image"), async (req, res) => {
       delete body.sheetLinkl;
     }
 
+    // اجلب الحالي للتأكد من slug
+    const current = await Course.findById(req.params.id);
+    if (!current) return res.status(404).json({ error: "الكورس غير موجود" });
+
+    if (body.slug && body.slug !== current.slug) {
+      body.slug = await ensureUniqueSlug(body.slug, current._id);
+    }
+
     // الروابط لو undefined خليها ""
     if (body.formLink === undefined) body.formLink = "";
     if (body.sheetLink === undefined) body.sheetLink = "";
 
-    const updatedCourse = await Course.findByIdAndUpdate(req.params.id, body, { new: true });
-    if (!updatedCourse) return res.status(404).json({ error: "الكورس غير موجود" });
+    const updatedCourse = await Course.findByIdAndUpdate(
+      req.params.id,
+      body,
+      { new: true }
+    );
 
     res.json({ message: "تم التعديل", course: updatedCourse });
   } catch (err) {
+    if (err && err.code === 11000) {
+      return res
+        .status(409)
+        .json({ error: "الـ slug مستخدم مسبقًا لكورس آخر." });
+    }
     console.error("خطأ في التعديل:", err);
     res.status(500).json({ error: err.message || "حدث خطأ أثناء التعديل" });
   }
@@ -267,7 +365,8 @@ router.delete("/:id", async (req, res) => {
   try {
     const { id } = req.params;
     const deleted = await Course.findByIdAndDelete(id);
-    if (!deleted) return res.status(404).json({ error: "لم يتم العثور على الكورس" });
+    if (!deleted)
+      return res.status(404).json({ error: "لم يتم العثور على الكورس" });
     res.json({ message: "✅ تم حذف الكورس بنجاح" });
   } catch (err) {
     console.error("فشل في حذف الكورس:", err.message);
@@ -276,7 +375,7 @@ router.delete("/:id", async (req, res) => {
 });
 
 /* ========== جلب المتقدمين من Google Sheet ========== */
-// يقبل ID أو slug — ولو ما في sheetLink يرجّع بيانات فاضية بدون خطأ
+// يقبل ID أو slug — ولو ما في sheetLink يرجّع بيانات فاضية
 router.get("/:id/applicants", async (req, res) => {
   try {
     const param = req.params.id;
@@ -289,22 +388,38 @@ router.get("/:id/applicants", async (req, res) => {
 
     const sheetLink = course.sheetLink || course.sheetLinkl; // اختياري
     if (!sheetLink) {
-      return res.json({ spreadsheetId: null, tabTitle: "", headers: [], rows: [] });
+      return res.json({
+        spreadsheetId: null,
+        tabTitle: "",
+        headers: [],
+        rows: [],
+      });
     }
 
     const { spreadsheetId, gid } = extractSpreadsheetIdAndGid(sheetLink);
     if (!spreadsheetId) {
-      return res.json({ spreadsheetId: null, tabTitle: "", headers: [], rows: [] });
+      return res.json({
+        spreadsheetId: null,
+        tabTitle: "",
+        headers: [],
+        rows: [],
+      });
     }
 
     const tabTitle = await detectTabTitle(spreadsheetId, gid);
     const table = await readSheet(spreadsheetId, tabTitle, "A:Z");
 
-    res.json({ spreadsheetId, tabTitle, headers: table.headers, rows: table.rows });
+    res.json({
+      spreadsheetId,
+      tabTitle,
+      headers: table.headers,
+      rows: table.rows,
+    });
   } catch (err) {
     console.error("فشل في جلب المتقدمين:", err);
     res.status(500).json({
-      error: "تعذر قراءة Google Sheet. تحقق من مشاركة الشيت مع Service Account والصلاحيات.",
+      error:
+        "تعذر قراءة Google Sheet. تحقق من مشاركة الشيت مع Service Account والصلاحيات.",
     });
   }
 });
